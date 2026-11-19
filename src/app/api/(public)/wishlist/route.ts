@@ -1,0 +1,154 @@
+import { NextRequest, NextResponse } from 'next/server'
+import { z } from 'zod'
+import { query, queryMany, queryOne } from '@/lib/shared/db'
+import { authenticateAnyUser as authenticateUser } from '@/lib/auth/jwt'
+import { cartOwner, existingCartOwner } from '@/lib/shared/guest-user'
+import {
+  VARIANT_MIN_PRICE_INCL_GST_SQL,
+  VARIANT_MIN_PRICE_EX_GST_SQL,
+  VARIANT_MIN_MRP_SQL,
+  VARIANT_STOCK_TOTAL_SQL,
+  PRODUCT_IN_STOCK_SQL,
+} from '@/lib/queries'
+import { getFeatureFlags } from '@/lib/catalog/site-controls'
+import { logActivity } from '@/lib/shared/activity'
+import { parseBody, zUuid } from '@/lib/shared/validate'
+
+const AddWishlistSchema = z
+  .object({
+    productId: zUuid.nullish(),
+    product_id: zUuid.nullish(),
+    variantId: zUuid.nullish(),
+  })
+  .refine(d => d.productId != null || d.product_id != null, { message: 'productId is required' })
+
+export async function GET(request: NextRequest) {
+  try {
+    const userId = await existingCartOwner((await authenticateUser(request))?.userId)
+    const idsOnly = new URL(request.url).searchParams.get('ids') === '1'
+    if (!userId) return NextResponse.json(idsOnly ? { productIds: [] } : { items: [] })
+
+    // ?ids=1: just the saved product ids, for the hearts and header count on every page.
+    if (idsOnly) {
+      const rows = await queryMany<{ product_id: string }>(
+        `SELECT wi.product_id::text AS product_id
+         FROM wishlist_items wi JOIN products p ON p.id = wi.product_id AND p.is_active = true
+         WHERE wi.user_id = $1`,
+        [userId]
+      )
+      return NextResponse.json({ productIds: rows.map(row => row.product_id) })
+    }
+
+    const { gstEnabled } = await getFeatureFlags()
+    const MIN_PRICE_SQL = gstEnabled ? VARIANT_MIN_PRICE_INCL_GST_SQL : VARIANT_MIN_PRICE_EX_GST_SQL
+
+    const wishlistItems = await queryMany(
+      `
+      SELECT
+        wi.id, wi.product_id, wi.created_at,
+        wi.snapshot_price, wi.snapshot_in_stock,
+        ${PRODUCT_IN_STOCK_SQL} AS inventory_in_stock,
+        json_build_object(
+          'id', p.id, 'name', p.name, 'slug', p.slug,
+          'base_price', p.base_price, 'price_ex_gst', p.price_ex_gst,
+          'mrp', p.mrp, 'has_variants', p.has_variants,
+          'is_digital', COALESCE(p.is_digital, FALSE),
+          'stock_status', p.stock_status,
+          'variant_stock_total', ${VARIANT_STOCK_TOTAL_SQL},
+          'variant_min_price', ${MIN_PRICE_SQL},
+          'variant_min_mrp', ${VARIANT_MIN_MRP_SQL},
+          'fragile', p.fragile,
+          'hazardous', p.hazardous,
+          'flammable', p.flammable,
+          'product_images', COALESCE(
+            (SELECT json_agg(json_build_object('thumbnail_url', COALESCE(pi.thumbnail_url, pi.image_url), 'is_primary', pi.is_primary))
+             FROM product_images pi WHERE pi.product_id = p.id),
+            '[]'::json
+          )
+        ) AS products
+      FROM wishlist_items wi
+      INNER JOIN products p ON wi.product_id = p.id AND p.is_active = true
+      WHERE wi.user_id = $1
+    `,
+      [userId]
+    )
+
+    return NextResponse.json({ items: wishlistItems || [] })
+  } catch (error) {
+    console.error('[wishlist] GET failed:', error)
+    return NextResponse.json({ error: 'Failed to fetch wishlist' }, { status: 500 })
+  }
+}
+
+export async function POST(request: NextRequest) {
+  try {
+    const body = await request.json()
+    const parsedWishlist = parseBody(AddWishlistSchema, body)
+    if (!parsedWishlist.ok) return parsedWishlist.response
+    const productId = parsedWishlist.data.product_id || parsedWishlist.data.productId
+
+    const userId = await cartOwner((await authenticateUser(request))?.userId)
+
+    const existing = await query('SELECT id FROM wishlist_items WHERE user_id = $1 AND product_id = $2', [
+      userId,
+      productId,
+    ])
+    if ((existing as any).rows?.length > 0) {
+      return NextResponse.json({ message: 'Item already in wishlist' })
+    }
+
+    const inserted = await query(
+      `INSERT INTO wishlist_items (user_id, product_id, snapshot_price, snapshot_in_stock, snapshot_taken_at)
+       SELECT $1::uuid, p.id, p.base_price, ${PRODUCT_IN_STOCK_SQL}, NOW()
+       FROM products p WHERE p.id = $2`,
+      [userId, productId]
+    )
+    if (!inserted.rowCount) return NextResponse.json({ error: 'Product not found' }, { status: 404 })
+
+    const auth = await authenticateUser(request)
+    if (auth?.userId) {
+      const product = await queryOne<{ name: string }>('SELECT name FROM products WHERE id = $1', [productId])
+      logActivity({
+        userId: auth.userId,
+        kind: 'wishlist_added',
+        referenceId: productId,
+        referenceType: 'products',
+        summary: `Added "${product?.name || 'a product'}" to wishlist`,
+      }).catch(() => {})
+    }
+
+    return NextResponse.json({ message: 'Item added to wishlist' })
+  } catch (error) {
+    console.error('[wishlist] POST failed:', error)
+    return NextResponse.json({ error: 'Failed to add to wishlist' }, { status: 500 })
+  }
+}
+
+export async function DELETE(request: NextRequest) {
+  try {
+    const { searchParams } = new URL(request.url)
+    const productId = searchParams.get('productId') || searchParams.get('product_id')
+
+    const userId = await existingCartOwner((await authenticateUser(request))?.userId)
+    if (!userId) return NextResponse.json({ message: 'Item removed from wishlist' })
+
+    await query('DELETE FROM wishlist_items WHERE product_id = $1 AND user_id = $2', [productId, userId])
+
+    const auth = await authenticateUser(request)
+    if (auth?.userId && productId) {
+      const product = await queryOne<{ name: string }>('SELECT name FROM products WHERE id = $1', [productId])
+      logActivity({
+        userId: auth.userId,
+        kind: 'wishlist_removed',
+        referenceId: productId,
+        referenceType: 'products',
+        summary: `Removed "${product?.name || 'a product'}" from wishlist`,
+      }).catch(() => {})
+    }
+
+    return NextResponse.json({ message: 'Item removed from wishlist' })
+  } catch (error) {
+    console.error('[wishlist] DELETE failed:', error)
+    return NextResponse.json({ error: 'Failed to remove from wishlist' }, { status: 500 })
+  }
+}
