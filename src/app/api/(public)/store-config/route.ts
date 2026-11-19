@@ -1,0 +1,55 @@
+import { NextResponse } from 'next/server'
+import { getSiteControls } from '@/lib/catalog/site-controls'
+import { storefrontAiAllowed } from '@/lib/shared/storefront-ai'
+import { resolveTenant } from '@/lib/tenancy/tenant-context'
+
+export const dynamic = 'force-dynamic'
+
+// Public, browser-safe store config. Bridges DB-backed settings to client
+// components that previously read NEXT_PUBLIC_* env vars at build time.
+// Contains NO secrets — only display identity, feature toggles, storefront limits.
+export async function GET() {
+  const c = await getSiteControls()
+  const aiStorefrontEnabled = await storefrontAiAllowed().catch(() => false)
+  // Store slug so the client can namespace on-device AI artifacts (the LoRA adapter) per tenant
+  // (#489). Non-secret; null on the platform/flagship host.
+  const slug = (await resolveTenant().catch(() => null))?.slug ?? null
+  return NextResponse.json(
+    {
+      slug,
+      identity: {
+        name: c.identity.name,
+        email: c.identity.email,
+        phone: c.identity.phone,
+        web: c.identity.web,
+        logoUrl: c.identity.logoUrl,
+      },
+      flags: {
+        razorpayEnabled: c.flags.razorpayEnabled,
+        upiEnabled: c.flags.upiEnabled,
+        codEnabled: c.flags.codEnabled,
+        gstEnabled: c.flags.gstEnabled,
+        ondeviceSummaryEnabled: c.flags.ondeviceSummaryEnabled,
+        ondeviceFinetuneEnabled: c.flags.ondeviceFinetuneEnabled,
+        ondeviceSummaryMobileEnabled: c.flags.ondeviceSummaryMobileEnabled,
+        ondeviceSummaryDesktopEnabled: c.flags.ondeviceSummaryDesktopEnabled,
+        ondeviceFinetuneMobileEnabled: c.flags.ondeviceFinetuneMobileEnabled,
+        ondeviceFinetuneDesktopEnabled: c.flags.ondeviceFinetuneDesktopEnabled,
+        aiStorefrontEnabled,
+        digitalProductsEnabled: c.flags.digitalProductsEnabled,
+        subscriptionsEnabled: c.flags.subscriptionsEnabled,
+        vaultDownloadsEnabled: c.flags.vaultDownloadsEnabled,
+      },
+      orderAutoCancelMinutes: c.values.orderAutoCancelMinutes,
+      storefront: {
+        featuredLimit: c.storefront.featuredLimit,
+        newArrivalsLimit: c.storefront.newArrivalsLimit,
+        metaTagline: c.storefront.metaTagline,
+      },
+    },
+    // No browser/CDN caching: flag changes must reach clients within the
+    // reader's own 30s server-side TTL, not compound with a browser cache
+    // window. The payload is tiny and per-store, so this is cheap.
+    { headers: { 'Cache-Control': 'private, no-store' } }
+  )
+}
